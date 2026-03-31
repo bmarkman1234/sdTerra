@@ -10,7 +10,7 @@ This project generates a high-resolution terrain map that combines:
 
 The script builds a bivariate (rain vs. sunshine) color map, adds cartographic elements (legend, north arrow, scale bar), and exports a final PNG.
 
-## What the script does (high level)
+## What the script does 
 
 1. Reads a boundary polygon (GeoJSON) for the target area.
 2. Downloads and processes DEM terrain data for that boundary.
@@ -28,10 +28,6 @@ The script builds a bivariate (rain vs. sunshine) color map, adds cartographic e
 ```r
 source("sdTerra.R")
 ```
-
-Output:
-
-- `outputs/map_rain_sun_relief.png`
 
 ## Inputs
 
