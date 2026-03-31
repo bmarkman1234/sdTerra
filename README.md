@@ -1,4 +1,11 @@
-# Sunshine + Precipitation Relief Map (R)
+# ☀️🌧️ Sunshine + Precipitation Relief Map (R)
+
+![R](https://img.shields.io/badge/Software-R-276DC3?logo=r&logoColor=white)
+![sf](https://img.shields.io/badge/Package-sf-1f77b4)
+![terra](https://img.shields.io/badge/Package-terra-2ca02c)
+![elevatr](https://img.shields.io/badge/Package-elevatr-8c564b)
+![ggplot2](https://img.shields.io/badge/Package-ggplot2-e377c2)
+![prism](https://img.shields.io/badge/Package-prism-9467bd)
 
 ![Map preview](outputs/map_rain_sun_relief.png)
 
