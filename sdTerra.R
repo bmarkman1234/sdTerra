@@ -1,228 +1,477 @@
 # =========================================================
-# San Diego County Terrain + Precipitation Map
-# Full script with:
-#   1) ggplot static map
-#   2) rayshader rendered map
+# Reusable Terrain + Rain + Sunshine Map (Any Area)
+# ---------------------------------------------------------
+# What this script does:
+# 1) Reads a user-provided boundary GeoJSON
+# 2) Downloads terrain (DEM) for that boundary
+# 3) Downloads PRISM precipitation and computes a mean climatology
+# 4) Builds a high-contrast bivariate map:
+#      - rain (blue axis)
+#      - sunshine proxy from terrain exposure (orange axis)
+# 5) Exports a high-resolution PNG map
 #
-# Notes:
-# - You need a San Diego County boundary file locally.
-# - This version uses elevation as a placeholder "precipitation proxy"
-#   so the script can run end-to-end.
-# - Replace the proxy section later with real PRISM precipitation.
+# Minimal required inputs:
+# - boundary GeoJSON in `data_raw/boundary` (or set `boundary_path` directly)
+#
+# Optional input:
+# - CSV of labels with columns: name, lon, lat
 # =========================================================
 
 # -----------------------------
-# 0. Install packages if needed
+# 0) User settings (edit here)
 # -----------------------------
-install.packages(c(
-  "sf", "terra", "elevatr", "ggplot2", "dplyr",
-  "viridis", "rayshader", "raster"
- ))
+area_name <- "San Diego County"
+display_climate_period <- "1991-2020"
+
+# Resolve paths relative to this script file when possible.
+get_script_dir <- function() {
+  args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", args, value = TRUE)
+  if (length(file_arg) > 0) {
+    return(dirname(normalizePath(sub("^--file=", "", file_arg[1]))))
+  }
+  if (!is.null(sys.frames()[[1]]$ofile)) {
+    return(dirname(normalizePath(sys.frames()[[1]]$ofile)))
+  }
+  getwd()
+}
+project_dir <- get_script_dir()
+
+# If NULL, first .geojson in boundary_dir will be used.
+boundary_path <- NULL
+boundary_dir <- file.path(project_dir, "data_raw", "boundary")
+
+# Optional labels CSV for cities/places. Must include: name, lon, lat
+# Example: label_points_csv <- "data_raw/labels/places.csv"
+label_points_csv <- NULL
+
+# Data/output directories
+precip_dir <- "data_raw/precip/prism"
+precip_dir <- file.path(project_dir, "data_raw", "precip", "prism")
+out_dir <- file.path(project_dir, "outputs")
+out_file <- file.path(out_dir, "map_rain_sun_relief.png")
+
+# Terrain and rendering controls
+# Increase `dem_zoom` for more DEM detail, at higher download/processing cost.
+dem_zoom <- 9
+dem_aggregate_factor <- 2
+output_dpi <- 600
+
+# -----------------------------
+# 1) Package checks
+# -----------------------------
+required_packages <- c("sf", "terra", "elevatr", "ggplot2", "prism")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    paste0(
+      "Missing packages: ",
+      paste(missing_packages, collapse = ", "),
+      "\nInstall with: install.packages(c(",
+      paste(sprintf("'%s'", missing_packages), collapse = ", "),
+      "))"
+    )
+  )
+}
 
 library(sf)
 library(terra)
 library(elevatr)
 library(ggplot2)
-library(dplyr)
-library(viridis)
-library(rayshader)
-library(raster)
+library(prism)
 
 # -----------------------------
-# 1. User file paths
+# 2) Setup folders and boundary
 # -----------------------------
-sd_boundary_path <- "data_raw/sd_county_boundary.geojson"
+dir.create(boundary_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(precip_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-ggplot_output_path    <- "outputs/sd_county_ggplot_map.png"
-rayshader_output_path <- "outputs/sd_county_rayshader_map.png"
+if (is.null(boundary_path)) {
+  boundary_files <- list.files(
+    path = boundary_dir,
+    pattern = "\\.geojson$",
+    full.names = TRUE,
+    recursive = TRUE
+  )
+
+  if (length(boundary_files) == 0) {
+    stop(
+      paste0(
+        "No boundary .geojson found in ",
+        boundary_dir,
+        ". Put one there or set boundary_path to an absolute file path."
+      )
+    )
+  }
+
+  boundary_path <- boundary_files[1]
+}
+
+# Read boundary and project to CA Albers (EPSG:3310).
+# For non-California areas you can swap this CRS if preferred.
+area_sf <- st_read(boundary_path, quiet = TRUE)
+area_sf <- st_transform(area_sf, 3310)
+area_vect <- vect(area_sf)
 
 # -----------------------------
-# 2. Create output folder
+# 3) Terrain + sunshine proxy
 # -----------------------------
-dir.create("outputs", showWarnings = FALSE, recursive = TRUE)
-
-# -----------------------------
-# 3. Read San Diego County boundary
-# -----------------------------
-sd <- st_read(sd_boundary_path, quiet = TRUE)
-
-# Reproject to California Albers
-sd <- st_transform(sd, 3310)
-sd_vect <- vect(sd)
-
-# -----------------------------
-# 4. Download DEM
-# -----------------------------
-# z = 9 or 10 is a decent starting point.
-# If too slow, drop to 8. If too coarse, try 10.
+# DEM from USGS via elevatr.
 dem_raw <- get_elev_raster(
-  locations = sd,
-  z = 9,
+  locations = area_sf,
+  z = dem_zoom,
   clip = "locations"
 )
 
 dem <- rast(dem_raw)
-
-# Project DEM to county CRS
 dem <- project(dem, "EPSG:3310")
+dem <- crop(dem, area_vect)
+dem <- mask(dem, area_vect)
+dem_small <- aggregate(dem, fact = dem_aggregate_factor, fun = mean, na.rm = TRUE)
 
-# Crop and mask to county
-dem <- crop(dem, sd_vect)
-dem <- mask(dem, sd_vect)
-
-# Aggregate for speed
-dem_small <- aggregate(dem, fact = 2, fun = mean, na.rm = TRUE)
-
-# -----------------------------
-# 5. Create hillshade
-# -----------------------------
-slope  <- terrain(dem_small, v = "slope", unit = "radians")
+slope <- terrain(dem_small, v = "slope", unit = "radians")
 aspect <- terrain(dem_small, v = "aspect", unit = "radians")
-hill   <- shade(slope, aspect, angle = 45, direction = 315)
+hill <- shade(slope, aspect, angle = 45, direction = 315)
+
+# Sunshine proxy:
+# south-facing and less-steep terrain is treated as sunnier.
+sun_raw <- cos(aspect - pi) * cos(slope)
+sun_min <- global(sun_raw, "min", na.rm = TRUE)[1, 1]
+sun_max <- global(sun_raw, "max", na.rm = TRUE)[1, 1]
+if (!is.finite(sun_min) || !is.finite(sun_max) || sun_max <= sun_min) {
+  stop("Invalid sunshine proxy raster.")
+}
+sun_norm <- (sun_raw - sun_min) / (sun_max - sun_min)
+
+# Additional relief term for stronger mountain contrast.
+slope_min <- global(slope, "min", na.rm = TRUE)[1, 1]
+slope_max <- global(slope, "max", na.rm = TRUE)[1, 1]
+if (!is.finite(slope_min) || !is.finite(slope_max) || slope_max <= slope_min) {
+  stop("Invalid slope raster.")
+}
+slope_norm <- (slope - slope_min) / (slope_max - slope_min)
 
 # -----------------------------
-# 6. Placeholder precipitation proxy
+# 4) PRISM precipitation normals
 # -----------------------------
-# This uses elevation as a stand-in so you can test the workflow.
-# Replace this block later with a real PRISM raster.
-ppt <- dem_small
+prism_dir_abs <- normalizePath(precip_dir, winslash = "/", mustWork = FALSE)
+options(prism.path = prism_dir_abs)
+if ("prism_set_dl_dir" %in% getNamespaceExports("prism")) {
+  prism::prism_set_dl_dir(prism_dir_abs)
+}
+
+if ("get_prism_normals" %in% getNamespaceExports("prism")) {
+  prism::get_prism_normals(
+    type = "ppt",
+    resolution = "800m",
+    annual = TRUE,
+    keepZip = FALSE
+  )
+} else {
+  stop("Your 'prism' package is too old. Please run install.packages('prism').")
+}
+
+download_dir <- prism_dir_abs
+if ("prism_get_dl_dir" %in% getNamespaceExports("prism")) {
+  download_dir <- prism::prism_get_dl_dir()
+}
+
+# Gather all downloaded raster files.
+ppt_files <- list.files(
+  path = download_dir,
+  pattern = "\\.(bil|tif)$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+# If only zipped files exist, unzip and re-scan.
+if (length(ppt_files) == 0) {
+  zip_files <- list.files(path = download_dir, pattern = "\\.zip$", recursive = TRUE, full.names = TRUE)
+  if (length(zip_files) > 0) {
+    for (zf in zip_files) utils::unzip(zf, exdir = dirname(zf))
+    ppt_files <- list.files(
+      path = download_dir,
+      pattern = "\\.(bil|tif)$",
+      recursive = TRUE,
+      full.names = TRUE
+    )
+  }
+}
+
+if (length(ppt_files) == 0) {
+  stop("No PRISM raster found. Check internet access and rerun.")
+}
+
+# Use the downloaded 800m annual normals raster.
+ppt_file <- sort(ppt_files)[length(ppt_files)]
+ppt <- rast(ppt_file)
+ppt_source <- "PRISM 30-year normals (1991-2020), 800m, annual ppt"
+
+ppt <- project(ppt, "EPSG:3310")
+ppt <- crop(ppt, area_vect)
+ppt <- mask(ppt, area_vect)
+ppt <- resample(ppt, dem_small, method = "bilinear")
 
 ppt_min <- global(ppt, "min", na.rm = TRUE)[1, 1]
 ppt_max <- global(ppt, "max", na.rm = TRUE)[1, 1]
-
+if (!is.finite(ppt_min) || !is.finite(ppt_max) || ppt_max <= ppt_min) {
+  stop("Invalid precipitation raster after processing.")
+}
 ppt_norm <- (ppt - ppt_min) / (ppt_max - ppt_min)
 
+# Contrast stretch (2nd to 98th percentile) to make differences pop.
+stretch_raster <- function(r, low_p = 0.02, high_p = 0.98, gamma = 1.0) {
+  qs <- global(r, quantile, probs = c(low_p, high_p), na.rm = TRUE)
+  lo <- qs[1, 1]
+  hi <- qs[2, 1]
+  if (!is.finite(lo) || !is.finite(hi) || hi <= lo) return(r)
+  out <- (r - lo) / (hi - lo)
+  out <- clamp(out, 0, 1)
+  out^gamma
+}
+
+# Slightly different gamma per layer to improve visual separation.
+ppt_norm <- stretch_raster(ppt_norm, gamma = 0.80)
+sun_norm <- stretch_raster(sun_norm, gamma = 0.90)
+
 # -----------------------------
-# 7. Convert rasters to data frames for ggplot
+# 5) Build map tables
 # -----------------------------
 hill_df <- as.data.frame(hill, xy = TRUE, na.rm = TRUE)
-ppt_df  <- as.data.frame(ppt_norm, xy = TRUE, na.rm = TRUE)
+ppt_df <- as.data.frame(ppt_norm, xy = TRUE, na.rm = TRUE)
+sun_df <- as.data.frame(sun_norm, xy = TRUE, na.rm = TRUE)
+slope_df <- as.data.frame(slope_norm, xy = TRUE, na.rm = TRUE)
 
 names(hill_df)[3] <- "hillshade"
-names(ppt_df)[3]  <- "ppt"
+names(ppt_df)[3] <- "ppt"
+names(sun_df)[3] <- "sun"
+names(slope_df)[3] <- "slope_norm"
 
-map_df <- left_join(hill_df, ppt_df, by = c("x", "y"))
+map_df <- merge(hill_df, ppt_df, by = c("x", "y"))
+map_df <- merge(map_df, sun_df, by = c("x", "y"))
+map_df <- merge(map_df, slope_df, by = c("x", "y"))
 
-# Clamp hillshade just in case
-map_df$hillshade <- pmax(pmin(map_df$hillshade, 1), 0)
+# Higher-contrast terrain alpha (darker shadows, stronger relief).
+map_df$hillshade <- pmax(pmin(map_df$hillshade, 1), 0)^0.22
+map_df$relief_alpha <- pmin(1, pmax(0.96, 1.20 * map_df$hillshade + 1.05 * map_df$slope_norm))
+
+# Bivariate class bins using quantiles (improves contrast in skewed data).
+make_quantile_breaks <- function(x, n = 5) {
+  b <- as.numeric(quantile(x, probs = seq(0, 1, length.out = n + 1), na.rm = TRUE, names = FALSE))
+  b <- unique(b)
+  if (length(b) < (n + 1)) {
+    b <- seq(min(x, na.rm = TRUE), max(x, na.rm = TRUE), length.out = n + 1)
+  }
+  b
+}
+
+rain_breaks <- make_quantile_breaks(map_df$ppt, n = 5)
+sun_breaks <- make_quantile_breaks(map_df$sun, n = 5)
+map_df$rain_class <- as.integer(cut(map_df$ppt, breaks = rain_breaks, include.lowest = TRUE))
+map_df$sun_class <- as.integer(cut(map_df$sun, breaks = sun_breaks, include.lowest = TRUE))
+
+# Color-blind-friendly high-contrast dark-blue/yellow bivariate palette.
+blend_hex <- function(col_a, col_b, w_a = 0.50) {
+  rgb_a <- grDevices::col2rgb(col_a)
+  rgb_b <- grDevices::col2rgb(col_b)
+  mix <- round(w_a * rgb_a + (1 - w_a) * rgb_b)
+  grDevices::rgb(mix[1], mix[2], mix[3], maxColorValue = 255)
+}
+
+rain_palette <- colorRampPalette(c("#dff3ff", "#8fd3ff", "#49a9ef", "#1477cc", "#0a4f9e"))(5)
+sun_palette <- colorRampPalette(c("#fffbd6", "#fff176", "#ffe033", "#efca1f", "#cbb01a"))(5)
+
+bi_palette <- matrix(NA_character_, nrow = 5, ncol = 5)
+for (i in 1:5) {
+  for (j in 1:5) {
+    bi_palette[i, j] <- blend_hex(rain_palette[i], sun_palette[j])
+  }
+}
+
+map_df$fill_col <- bi_palette[cbind(map_df$rain_class, map_df$sun_class)]
+map_df$fill_col[is.na(map_df$fill_col)] <- "#d9d9d9"
+
+# Layout helpers
+x_rng <- range(map_df$x, na.rm = TRUE)
+y_rng <- range(map_df$y, na.rm = TRUE)
+dx <- diff(x_rng)
+dy <- diff(y_rng)
+
+# Small tight legend (bottom-left)
+legend_df <- expand.grid(sun_class = 1:5, rain_class = 1:5)
+legend_df$fill_col <- bi_palette[cbind(legend_df$rain_class, legend_df$sun_class)]
+leg_x0 <- x_rng[1] + 0.05 * dx
+leg_y0 <- y_rng[1] + 0.09 * dy
+leg_w <- 0.020 * dx
+leg_h <- 0.020 * dy
+legend_df$x <- leg_x0 + (legend_df$sun_class - 1) * leg_w
+legend_df$y <- leg_y0 + (legend_df$rain_class - 1) * leg_h
+
+# Legend axis anchor coordinates (computed from legend geometry).
+legend_x_left <- leg_x0 - 0.90 * leg_w
+legend_x_right <- leg_x0 + 4.90 * leg_w
+legend_y_bottom <- leg_y0 - 0.80 * leg_h
+legend_y_top <- leg_y0 + 4.90 * leg_h
+legend_x_mid <- (legend_x_left + legend_x_right) / 2
+legend_y_mid <- (leg_y0 + leg_y0 + 4 * leg_h) / 2
+
+# Scale bar + north arrow in lower-right margin (off map)
+sb_seg <- 7500
+sb_x0 <- x_rng[2] - 0.20 * dx
+sb_y0 <- y_rng[1] - 0.015 * dy
+
+# Optional label points
+label_sf <- NULL
+label_xy <- NULL
+if (!is.null(label_points_csv) && file.exists(label_points_csv)) {
+  labels_df <- read.csv(label_points_csv, stringsAsFactors = FALSE)
+  needed <- c("name", "lon", "lat")
+  if (!all(needed %in% names(labels_df))) {
+    stop("label_points_csv must include columns: name, lon, lat")
+  }
+  label_sf <- st_as_sf(labels_df, coords = c("lon", "lat"), crs = 4326)
+  label_sf <- st_transform(label_sf, 3310)
+  label_xy <- cbind(st_drop_geometry(label_sf), st_coordinates(label_sf))
+} else if (grepl("san diego", tolower(area_name))) {
+  # Default labels for San Diego when no CSV is provided.
+  labels_df <- data.frame(
+    name = c("San Diego", "Oceanside", "El Cajon", "Chula Vista", "Julian"),
+    lon = c(-117.1611, -117.3795, -116.9625, -117.0842, -116.6014),
+    lat = c(32.7157, 33.1959, 32.7948, 32.6401, 33.0787)
+  )
+  label_sf <- st_as_sf(labels_df, coords = c("lon", "lat"), crs = 4326)
+  label_sf <- st_transform(label_sf, 3310)
+  label_xy <- cbind(st_drop_geometry(label_sf), st_coordinates(label_sf))
+}
 
 # -----------------------------
-# 8. ggplot static map
+# 6) Draw map
 # -----------------------------
+# Font fallback chain (uses MonoLisa when installed).
+font_candidates <- c("MonoLisa", "JetBrains Mono", "Cascadia Mono", "Consolas", "Menlo", "monospace")
+map_font <- "monospace"
+if (requireNamespace("systemfonts", quietly = TRUE)) {
+  fams <- unique(systemfonts::system_fonts()$family)
+  hits <- font_candidates[font_candidates %in% fams]
+  if (length(hits) > 0) map_font <- hits[1]
+}
+
 p <- ggplot() +
-  geom_raster(
-    data = map_df,
-    aes(x = x, y = y, fill = ppt, alpha = hillshade)
+  geom_raster(data = map_df, aes(x = x, y = y, fill = fill_col, alpha = relief_alpha)) +
+  scale_fill_identity() +
+  scale_alpha(range = c(0.97, 1.00), guide = "none") +
+  geom_tile(
+    data = legend_df,
+    aes(x = x, y = y, fill = fill_col),
+    width = leg_w,
+    height = leg_h,
+    inherit.aes = FALSE
   ) +
-  scale_fill_viridis_c(
-    name = "Relative\nmoisture",
-    option = "C",
-    direction = -1
+  annotate(
+    "segment",
+    x = legend_x_left, xend = legend_x_left,
+    y = leg_y0 + 0.10 * leg_h, yend = legend_y_top,
+    color = "grey20", linewidth = 0.35,
+    arrow = grid::arrow(length = grid::unit(0.08, "inches"), type = "closed")
   ) +
-  scale_alpha(range = c(0.45, 0.95), guide = "none") +
-  geom_sf(data = sd, fill = NA, color = "grey15", linewidth = 0.35) +
-  coord_sf(datum = NA) +
+  annotate("text", x = legend_x_left - 0.55 * leg_w, y = legend_y_mid, label = "more rain", angle = 90, size = 2.5, color = "grey20") +
+  annotate(
+    "segment",
+    x = leg_x0 + 0.10 * leg_w, xend = legend_x_right,
+    y = legend_y_bottom, yend = legend_y_bottom,
+    color = "grey20", linewidth = 0.35,
+    arrow = grid::arrow(length = grid::unit(0.08, "inches"), type = "closed")
+  ) +
+  annotate("text", x = legend_x_mid, y = legend_y_bottom - 0.60 * leg_h, label = "sunnier", size = 2.5, color = "grey20") +
+  annotate("rect", xmin = sb_x0, xmax = sb_x0 + sb_seg, ymin = sb_y0, ymax = sb_y0 + 0.0065 * dy, fill = "black", color = "black", linewidth = 0.2) +
+  annotate("rect", xmin = sb_x0 + sb_seg, xmax = sb_x0 + 2 * sb_seg, ymin = sb_y0, ymax = sb_y0 + 0.0065 * dy, fill = "white", color = "black", linewidth = 0.2) +
+  annotate("rect", xmin = sb_x0 + 2 * sb_seg, xmax = sb_x0 + 3 * sb_seg, ymin = sb_y0, ymax = sb_y0 + 0.0065 * dy, fill = "black", color = "black", linewidth = 0.2) +
+  annotate("rect", xmin = sb_x0 + 3 * sb_seg, xmax = sb_x0 + 4 * sb_seg, ymin = sb_y0, ymax = sb_y0 + 0.0065 * dy, fill = "white", color = "black", linewidth = 0.2) +
+  annotate("segment", x = sb_x0 + 4.8 * sb_seg, xend = sb_x0 + 4.8 * sb_seg, y = sb_y0 + 0.002 * dy, yend = sb_y0 + 0.060 * dy, linewidth = 0.8, color = "grey10") +
+  annotate("segment", x = sb_x0 + 4.8 * sb_seg, xend = sb_x0 + 4.5 * sb_seg, y = sb_y0 + 0.060 * dy, yend = sb_y0 + 0.048 * dy, linewidth = 0.8, color = "grey10") +
+  annotate("segment", x = sb_x0 + 4.8 * sb_seg, xend = sb_x0 + 5.1 * sb_seg, y = sb_y0 + 0.060 * dy, yend = sb_y0 + 0.048 * dy, linewidth = 0.8, color = "grey10") +
+  annotate("text", x = sb_x0 + 4.8 * sb_seg, y = sb_y0 + 0.073 * dy, label = "N", size = 3.4, fontface = "bold", color = "grey10") +
+  annotate("text", x = sb_x0 + 2 * sb_seg, y = sb_y0 - 0.014 * dy, label = "30 km", size = 2.7, color = "grey10") +
+  coord_sf(datum = NA, clip = "off") +
   labs(
-    title = "Terrain and moisture gradient in San Diego County",
-    subtitle = "Shaded relief with placeholder moisture proxy",
-    caption = "Boundary: local file | DEM: elevatr/USGS | Moisture layer: elevation proxy"
+    title = paste("Sunshine and Precipitation in", area_name),
+    subtitle = paste0("Climate period ", display_climate_period, " with shaded relief"),
+    caption = "Sources: PRISM | USGS elevatr | Terrain exposure proxy"
   ) +
-  theme_void() +
+  theme_minimal(base_family = map_font) +
   theme(
-    plot.title = element_text(size = 20, face = "bold"),
-    plot.subtitle = element_text(size = 11),
-    plot.caption = element_text(size = 8),
-    legend.position = c(0.88, 0.22),
-    legend.title = element_text(size = 9),
-    legend.text = element_text(size = 8)
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    panel.background = element_rect(fill = "#ffffff", color = NA),
+    plot.background = element_rect(fill = "#ffffff", color = NA),
+    plot.title = element_text(size = 23, face = "bold", color = "grey10"),
+    plot.subtitle = element_text(size = 12, color = "grey20", margin = margin(b = 8)),
+    plot.caption = element_text(size = 6.8, color = "grey35", hjust = 0),
+    plot.margin = margin(12, 12, 26, 12)
   )
 
-print(p)
+# Optional labels to make cities/places pop when provided.
+if (!is.null(label_sf) && nrow(label_sf) > 0) {
+  label_nudge_y <- 0.015 * dy
 
+  p <- p +
+    geom_sf(data = label_sf, shape = 21, fill = "#ffd84d", color = "black", size = 2.7, stroke = 0.65)
+
+  if (requireNamespace("ggrepel", quietly = TRUE)) {
+    p <- p + ggrepel::geom_label_repel(
+      data = label_xy,
+      aes(x = X, y = Y, label = name),
+      size = 3.2,
+      color = "#141414",
+      fill = scales::alpha("white", 0.75),
+      label.size = 0,
+      seed = 42,
+      nudge_y = label_nudge_y,
+      direction = "y",
+      box.padding = 0.18,
+      point.padding = 0.35,
+      force = 0.8,
+      min.segment.length = 0,
+      segment.color = scales::alpha("#222222", 0.65)
+    )
+  } else {
+    p <- p +
+      geom_segment(
+        data = label_xy,
+        aes(x = X, y = Y, xend = X, yend = Y + label_nudge_y),
+        linewidth = 0.3,
+        color = scales::alpha("#222222", 0.65)
+      ) +
+      geom_label(
+        data = label_xy,
+        aes(x = X, y = Y + label_nudge_y, label = name),
+        size = 3.2,
+        color = "#141414",
+        fill = scales::alpha("white", 0.75),
+        label.size = 0,
+        label.r = grid::unit(0.08, "lines")
+      )
+  }
+}
+
+# -----------------------------
+# 7) Save output
+# -----------------------------
 ggsave(
-  filename = ggplot_output_path,
+  filename = out_file,
   plot = p,
   width = 10,
   height = 8,
-  dpi = 300,
-  bg = "white"
+  dpi = output_dpi,
+  bg = "#ffffff"
 )
 
-# -----------------------------
-# 9. Prepare data for rayshader
-# -----------------------------
-# Convert terra raster to raster package object first
-dem_raster <- raster(dem_small)
+cat("Saved map to:", out_file, "\n")
+cat("Boundary used:", boundary_path, "\n")
+cat("PRISM source:", ppt_source, "\n")
 
-# rayshader needs a matrix
-dem_mat <- raster_to_matrix(dem_raster)
-
-# -----------------------------
-# 10. Build color overlay for rayshader
-# -----------------------------
-# Convert normalized raster values to colors
-ppt_vals <- values(ppt_norm)
-
-pal <- colorRampPalette(c(
-  "#e8d9a8",  # tan
-  "#c8d36b",  # yellow-green
-  "#5dbb63",  # green
-  "#2c7fb8"   # blue
-))
-
-color_breaks <- 256
-ppt_cuts <- cut(ppt_vals, breaks = color_breaks, include.lowest = TRUE)
-ppt_cols <- pal(color_breaks)[ppt_cuts]
-
-# Rebuild into raster dimensions
-nrows <- nrow(dem_small)
-ncols <- ncol(dem_small)
-
-ppt_matrix <- matrix(ppt_cols, nrow = nrows, ncol = ncols, byrow = TRUE)
-
-# rayshader matrix orientation sometimes needs flipping
-ppt_matrix <- ppt_matrix[nrow(ppt_matrix):1, ]
-
-# -----------------------------
-# 11. Create rayshader map
-# -----------------------------
-base_map <- sphere_shade(dem_mat, texture = "desert")
-
-ray_shadow  <- ray_shade(dem_mat, zscale = 15, sunaltitude = 35, sunangle = 315)
-amb_shadow  <- ambient_shade(dem_mat, zscale = 15)
-
-final_map <- base_map |>
-  add_overlay(ppt_matrix, alphalayer = 0.65) |>
-  add_shadow(ray_shadow, 0.35) |>
-  add_shadow(amb_shadow, 0.20)
-
-# Plot in R viewer
-plot_map(final_map)
-
-# Save high-res 2D rayshader image
-png(
-  filename = rayshader_output_path,
-  width = 2400,
-  height = 1800,
-  res = 300
-)
-plot_map(final_map)
-dev.off()
-
-# -----------------------------
-# 12. Optional 3D preview
-# -----------------------------
-# Uncomment if you want a 3D render window.
-# render_3d(
-#   final_map,
-#   dem_mat,
-#   zscale = 15,
-#   fov = 0,
-#   theta = -45,
-#   phi = 45,
-#   zoom = 0.7,
-#   windowsize = c(1000, 800)
-# )
-
-cat("Saved ggplot map to:", ggplot_output_path, "\n")
-cat("Saved rayshader map to:", rayshader_output_path, "\n")
