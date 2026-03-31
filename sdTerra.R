@@ -417,46 +417,20 @@ p <- ggplot() +
 
 # Optional labels to make cities/places pop when provided.
 if (!is.null(label_sf) && nrow(label_sf) > 0) {
-  label_nudge_y <- 0.015 * dy
+  label_nudge_y <- 0.022 * dy
 
   p <- p +
     geom_sf(data = label_sf, shape = 21, fill = "#ffd84d", color = "black", size = 2.7, stroke = 0.65)
-
-  if (requireNamespace("ggrepel", quietly = TRUE)) {
-    p <- p + ggrepel::geom_label_repel(
+  p <- p +
+    geom_label(
       data = label_xy,
-      aes(x = X, y = Y, label = name),
+      aes(x = X, y = Y + label_nudge_y, label = name),
       size = 3.2,
       color = "#141414",
-      fill = scales::alpha("white", 0.75),
+      fill = scales::alpha("white", 0.78),
       label.size = 0,
-      seed = 42,
-      nudge_y = label_nudge_y,
-      direction = "y",
-      box.padding = 0.18,
-      point.padding = 0.35,
-      force = 0.8,
-      min.segment.length = 0,
-      segment.color = scales::alpha("#222222", 0.65)
+      label.r = grid::unit(0.08, "lines")
     )
-  } else {
-    p <- p +
-      geom_segment(
-        data = label_xy,
-        aes(x = X, y = Y, xend = X, yend = Y + label_nudge_y),
-        linewidth = 0.3,
-        color = scales::alpha("#222222", 0.65)
-      ) +
-      geom_label(
-        data = label_xy,
-        aes(x = X, y = Y + label_nudge_y, label = name),
-        size = 3.2,
-        color = "#141414",
-        fill = scales::alpha("white", 0.75),
-        label.size = 0,
-        label.r = grid::unit(0.08, "lines")
-      )
-  }
 }
 
 # -----------------------------
